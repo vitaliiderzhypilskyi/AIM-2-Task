@@ -1,54 +1,92 @@
 import networkx as nx
-from itertools import combinations
 import json
+from itertools import combinations
 
-print("Завантажую граф з JSON...")
-with open("iam_graph_full.json", "r", encoding="utf-8") as f:
-    data = json.load(f)
-G = nx.node_link_graph(data)
 
-print("Збираю конфлікти ролей (SoD)...")
-conflicts = set()
-for u, v, d in G.edges(data=True):
-    if str(d.get('type')) == 'conflicts_with':
-        conflicts.add((u, v))
-        conflicts.add((v, u))
+def analyze_a7_dead_workflows(file_path="iam_graph_full.json"):
+    print(f"Завантажую граф з {file_path}...")
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        G = nx.node_link_graph(data)
+    except Exception as e:
+        print(f"Помилка завантаження файлу: {e}")
+        return
 
-print("Шукаю, які ролі дають доступ до яких сервісів...")
-service_roles = {}
-for u, v, d in G.edges(data=True):
-    if str(d.get('type')) == 'grant':
-        if v not in service_roles:
-            service_roles[v] = set()
-        service_roles[v].add(u)
+    print("Аудит A7: Аналізую бізнес-процеси...")
 
-print("Аналізую бізнес-процеси на наявність логічних тупиків...")
-dead_workflows = []
-workflows = [n for n, d in G.nodes(data=True) if str(d.get('type')) == 'Workflow']
+    conflicts = set()
+    for u, v, d in G.edges(data=True):
+        if str(d.get('type')) == 'sod_conflict':
+            conflicts.add((u, v))
+            conflicts.add((v, u))
 
-for wf in workflows:
-    steps = [v for u, v, d in G.edges(wf, data=True) if str(d.get('type')) == 'workflow_step']
-    is_dead = False
+    service_roles = {}
+    for u, v, d in G.edges(data=True):
+        if str(d.get('type')) == 'grant':
+            if v not in service_roles:
+                service_roles[v] = set()
+            service_roles[v].add(u)
 
-    for srv1, srv2 in combinations(steps, 2):
-        if srv1 not in service_roles or srv2 not in service_roles:
-            continue
+    # ДВІ КАТЕГОРІЇ ПОМИЛОК
+    dead_by_sod = []
+    dead_by_missing_role = []
 
-        for r1 in service_roles[srv1]:
-            for r2 in service_roles[srv2]:
-                if (r1, r2) in conflicts:
-                    dead_workflows.append((wf, srv1, srv2, r1, r2))
-                    is_dead = True
+    workflows = [n for n, d in G.nodes(data=True) if str(d.get('type')) == 'Workflow']
+
+    for wf in workflows:
+        steps = [v for u, v, d in G.out_edges(wf, data=True) if str(d.get('type')) == 'workflow_step']
+
+        has_sod = False
+        sod_details = None
+        missing_details = None
+
+        for srv1, srv2 in combinations(steps, 2):
+            roles1 = service_roles.get(srv1, set())
+            roles2 = service_roles.get(srv2, set())
+
+            # Якщо ролей немає, запам'ятовуємо, але продовжуємо шукати SoD
+            if not roles1 or not roles2:
+                if not missing_details:
+                    missing_details = (srv1, srv2)
+                continue
+
+            all_blocked = True
+            for r1 in roles1:
+                for r2 in roles2:
+                    if (r1, r2) not in conflicts:
+                        all_blocked = False
+                        break
+                if not all_blocked:
                     break
-            if is_dead: break
-        if is_dead: break
 
-print(f"\n--- РЕЗУЛЬТАТ A7 ---")
-print(f"Кількість 'мертвих' бізнес-процесів: {len(dead_workflows)}")
-if dead_workflows:
-    print("\nПриклади неможливих процесів:")
-    for wf, srv1, srv2, r1, r2 in dead_workflows[:5]:
-        print(f"  {wf} заблоковано через конфлікт.")
-        print(f"  Механізм: Крок {srv1} вимагає роль {r1}, а Крок {srv2} вимагає {r2}.")
-else:
-    print("Висновок: Логічних тупиків не знайдено (всі процеси можуть бути виконані безпечно).")
+            if all_blocked:
+                has_sod = True
+                sod_details = (srv1, srv2, list(roles1)[0], list(roles2)[0])
+                break  # Знайшли SoD - це найвищий пріоритет, зупиняємось для цього WF
+
+        # Розподіляємо по категоріях
+        if has_sod:
+            dead_by_sod.append((wf, *sod_details))
+        elif missing_details:
+            dead_by_missing_role.append((wf, *missing_details))
+
+    print(f"\n--- РЕЗУЛЬТАТ A7 ---")
+    print(f"Всього 'мертвих' процесів знайдено: {len(dead_by_sod) + len(dead_by_missing_role)}")
+    print(f" З них через конфлікт інтересів (SoD): {len(dead_by_sod)}")
+    print(f" З них через архітектурні помилки (немає ролей до сервісів): {len(dead_by_missing_role)}")
+
+    if dead_by_sod:
+        print("\n--- ПРИКЛАДИ SoD КОНФЛІКТІВ (Політика безпеки) ---")
+        for wf, srv1, srv2, r1, r2 in dead_by_sod[:5]:
+            print(f"  {wf} заблоковано. Крок {srv1} вимагає {r1}, а Крок {srv2} вимагає {r2} (Конфлікт!)")
+
+    if dead_by_missing_role:
+        print("\n--- ПРИКЛАДИ АРХІТЕКТУРНИХ ТУПИКІВ (Осиротілі сервіси) ---")
+        for wf, srv1, srv2 in dead_by_missing_role[:5]:
+            print(f"  {wf} заблоковано: відсутні будь-які ролі для доступу до {srv1} або {srv2}.")
+
+
+if __name__ == "__main__":
+    # analyze_a7_dead_workflows("iam_graph_full.json")
+    analyze_a7_dead_workflows("iam_graph_small.json")
